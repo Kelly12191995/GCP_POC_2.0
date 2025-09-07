@@ -9,11 +9,7 @@ import streamlit as st
 import pandas as pd
 import PyPDF2
 import pdfplumber
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
+import tempfile
 
 try:
     from fpdf import FPDF  # type: ignore
@@ -253,7 +249,6 @@ def conversation_to_text(conversation: List[Dict[str, str]]) -> str:
         lines.append(f"{role}: {msg.get('content', '')}")
     return "\n\n".join(lines)
 
-
 def conversation_to_pdf(conversation: List[Dict[str, str]]) -> Optional[bytes]:
     """Return PDF bytes for the conversation; requires fpdf."""
     if FPDF is None:
@@ -267,39 +262,55 @@ def conversation_to_pdf(conversation: List[Dict[str, str]]) -> Optional[bytes]:
         pdf.multi_cell(0, 10, line)
     return pdf.output(dest="S").encode("latin-1")
 
-
-def send_conversation_email(to_email: str, conversation: List[Dict[str, str]], pdf_bytes: Optional[bytes]) -> str:
-    """Email conversation to the given address using Outlook SMTP."""
-    sender = "aidigitaladvocacyplatform@bell.ca"
-    password = os.environ.get("OUTLOOK_APP_PASSWORD")
-    text = conversation_to_text(conversation)
-    msg = MIMEMultipart()
-    msg["From"] = sender
-    msg["To"] = to_email
-    msg["Subject"] = "Conversation History"
-    msg.attach(MIMEText(text, "plain"))
-
-    txt_part = MIMEBase("application", "octet-stream")
-    txt_part.set_payload(text.encode("utf-8"))
-    encoders.encode_base64(txt_part)
-    txt_part.add_header("Content-Disposition", "attachment", filename="conversation.txt")
-    msg.attach(txt_part)
-
-    if pdf_bytes:
-        pdf_part = MIMEBase("application", "pdf")
-        pdf_part.set_payload(pdf_bytes)
-        encoders.encode_base64(pdf_part)
-        pdf_part.add_header("Content-Disposition", "attachment", filename="conversation.pdf")
-        msg.attach(pdf_part)
-
-    if not password:
-        return "Email password not configured."
+def send_conversation_email(
+    to_email: str,
+    conversation: List[Dict[str, str]],
+    pdf_bytes: Optional[bytes],
+    report_path: str,
+    subject: str = "Conversation History",
+    body: str = "Please see attached conversation and report.",
+) -> str:
+    """Email conversation and selected report using local Outlook."""
     try:
-        with smtplib.SMTP("smtp.office365.com", 587) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.send_message(msg)
-        return "Email sent."
+        import win32com.client  # type: ignore
+    except Exception:
+        return "Outlook is not available on this system."
+
+    text = conversation_to_text(conversation)
+
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.To = to_email
+        mail.Subject = subject
+        mail.Body = body
+        mail.SentOnBehalfOfName = "aidigitaladvocacyplatform@bell.ca"
+
+        # Attach conversation TXT
+        txt_tmp = None
+        pdf_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tf:
+                tf.write(text.encode("utf-8"))
+                txt_tmp = tf.name
+            mail.Attachments.Add(txt_tmp)
+
+            if pdf_bytes:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as pf:
+                    pf.write(pdf_bytes)
+                    pdf_tmp = pf.name
+                mail.Attachments.Add(pdf_tmp)
+
+            if report_path and os.path.exists(report_path):
+                mail.Attachments.Add(os.path.abspath(report_path))
+
+            mail.Send()
+            return "Email sent."
+        finally:
+            if txt_tmp and os.path.exists(txt_tmp):
+                os.unlink(txt_tmp)
+            if pdf_tmp and os.path.exists(pdf_tmp):
+                os.unlink(pdf_tmp)
     except Exception as e:
         return f"Failed to send email: {e}"
 
@@ -328,7 +339,7 @@ class AIClient:
             return "AI client unavailable."
         try:
             response = self.client.models.generate_content(
-                model='gemini-2.5-pro',
+                model='gemini-2.0-flash-001',
                 contents=[prompt],
                 config={"temperature": 0.0}
             )
@@ -448,9 +459,9 @@ def main():
         focus = report_cfg.get("focus_areas", [])
         if focus:
             st.markdown(
-                "<ul class='focus-list'>" +
-                "".join([f"<li>{html.escape(x)}</li>" for x in focus]) +
-                "</ul>",
+                "<ul class='focus-list'>"
+                + "".join([f"<li>{html.escape(x)}</li>" for x in focus])
+                + "</ul>",
                 unsafe_allow_html=True
             )
 
@@ -467,7 +478,7 @@ def main():
         data=file_bytes,
         file_name=f"{selected_report.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.{ext}",
         mime=mime,
-        help="Download the original report file"
+        help="Download the original report file",
     )
 
     st.divider()
@@ -477,7 +488,8 @@ def main():
 
     # ---------------- Chat FIRST (highlight the core) ----------------
     st.subheader("Chat with the report")
-    st.caption('<span class="chat-subtle">Ask direct questions. The assistant will cite the report content implicitly.</span>', unsafe_allow_html=True)
+    st.caption('<span class="chat-subtle">Ask direct questions. The assistant will cite the report content implicitly.</span>',
+               unsafe_allow_html=True)
 
     for msg in st.session_state.conversation:
         with st.chat_message(msg["role"]):
@@ -608,11 +620,17 @@ def main():
             )
         else:
             st.caption("Install 'fpdf' package to enable PDF export.")
-        email_addr = st.text_input("Send conversation to email:")
+        email_addr = st.text_input("Recipient email address")
         if st.button("Send Email") and email_addr:
-            status = send_conversation_email(email_addr, st.session_state.conversation, pdf_bytes)
+            status = send_conversation_email(
+                email_addr,
+                st.session_state.conversation,
+                pdf_bytes,
+                file_path,
+            )
             st.info(status)
 
 if __name__ == "__main__":
     main()
+
 
