@@ -332,9 +332,16 @@ class ReportAnalyzer:
             st.error(f"Error reading file for download: {e}")
             return b"", "application/octet-stream"
 
-    def generate_ai_content(self, unified_prompt: str, data_context: str = "", question_context: str = "") -> str:
+    def generate_ai_content(
+        self,
+        unified_prompt: str,
+        question: str,
+        data_context: str = "",
+        question_context: str = "",
+    ) -> str:
         """Generate AI output (no sentence limit)."""
         parts = [unified_prompt]
+        parts.append(f"\nQuestion: {question}")
         if question_context:
             parts.append(f"\nSpecific Context: {question_context}")
         parts.append(f"\nData:\n{data_context}")
@@ -489,6 +496,7 @@ def main():
 
                 response = analyzer.generate_ai_content(
                     unified_prompt=unified_prompt,
+                    question=user_input,
                     data_context=final_context,
                     question_context=effective_qctx
                 )
