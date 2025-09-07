@@ -4,12 +4,21 @@ import logging
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 import importlib.util
-import re
 
 import streamlit as st
 import pandas as pd
 import PyPDF2
 import pdfplumber
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+try:
+    from fpdf import FPDF  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    FPDF = None
 
 # ------------------------- MUST BE FIRST STREAMLIT CALL -------------------------
 st.set_page_config(
@@ -234,6 +243,67 @@ def ccts_answer_style_instruction() -> str:
     )
 
 # ===========================================================
+#  Conversation helpers
+# ===========================================================
+def conversation_to_text(conversation: List[Dict[str, str]]) -> str:
+    """Serialize conversation messages into plain text."""
+    lines = []
+    for msg in conversation:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        lines.append(f"{role}: {msg.get('content', '')}")
+    return "\n\n".join(lines)
+
+
+def conversation_to_pdf(conversation: List[Dict[str, str]]) -> Optional[bytes]:
+    """Return PDF bytes for the conversation; requires fpdf."""
+    if FPDF is None:
+        return None
+    text = conversation_to_text(conversation)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_font("Arial", size=12)
+    for line in text.split("\n"):
+        pdf.multi_cell(0, 10, line)
+    return pdf.output(dest="S").encode("latin-1")
+
+
+def send_conversation_email(to_email: str, conversation: List[Dict[str, str]], pdf_bytes: Optional[bytes]) -> str:
+    """Email conversation to the given address using Outlook SMTP."""
+    sender = "aidigitaladvocacyplatform@bell.ca"
+    password = os.environ.get("OUTLOOK_APP_PASSWORD")
+    text = conversation_to_text(conversation)
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = to_email
+    msg["Subject"] = "Conversation History"
+    msg.attach(MIMEText(text, "plain"))
+
+    txt_part = MIMEBase("application", "octet-stream")
+    txt_part.set_payload(text.encode("utf-8"))
+    encoders.encode_base64(txt_part)
+    txt_part.add_header("Content-Disposition", "attachment", filename="conversation.txt")
+    msg.attach(txt_part)
+
+    if pdf_bytes:
+        pdf_part = MIMEBase("application", "pdf")
+        pdf_part.set_payload(pdf_bytes)
+        encoders.encode_base64(pdf_part)
+        pdf_part.add_header("Content-Disposition", "attachment", filename="conversation.pdf")
+        msg.attach(pdf_part)
+
+    if not password:
+        return "Email password not configured."
+    try:
+        with smtplib.SMTP("smtp.office365.com", 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+        return "Email sent."
+    except Exception as e:
+        return f"Failed to send email: {e}"
+
+# ===========================================================
 #  AI Client (Gemini via Vertex)
 # ===========================================================
 class AIClient:
@@ -358,6 +428,9 @@ def main():
 
     analyzer = ReportAnalyzer(reports_config)
 
+    if "conversation" not in st.session_state:
+        st.session_state.conversation = []
+
     # Sidebar
     with st.sidebar:
         st.header("📋 Report")
@@ -405,6 +478,11 @@ def main():
     # ---------------- Chat FIRST (highlight the core) ----------------
     st.subheader("Chat with the report")
     st.caption('<span class="chat-subtle">Ask direct questions. The assistant will cite the report content implicitly.</span>', unsafe_allow_html=True)
+
+    for msg in st.session_state.conversation:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
     chat_input = st.chat_input(f"Ask about {selected_report}...")
 
     # ---------------- Sample Questions BELOW chat ----------------
@@ -442,6 +520,7 @@ def main():
 
     # Respond with AI
     if user_input and df is not None:
+        st.session_state.conversation.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.write(user_input)
 
@@ -501,12 +580,39 @@ def main():
                     question_context=effective_qctx
                 )
                 st.write(response)
+                st.session_state.conversation.append({"role": "assistant", "content": response})
 
     elif user_input and df is None:
         with st.chat_message("assistant"):
             st.write("Please ensure the report file is available before asking questions.")
 
+    if st.session_state.conversation:
+        st.divider()
+        st.subheader("Conversation History")
+        conv_text = conversation_to_text(st.session_state.conversation)
+        txt_bytes = conv_text.encode("utf-8")
+        pdf_bytes = conversation_to_pdf(st.session_state.conversation)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        st.download_button(
+            "Download Conversation (TXT)",
+            data=txt_bytes,
+            file_name=f"conversation_{timestamp}.txt",
+            mime="text/plain",
+        )
+        if pdf_bytes:
+            st.download_button(
+                "Download Conversation (PDF)",
+                data=pdf_bytes,
+                file_name=f"conversation_{timestamp}.pdf",
+                mime="application/pdf",
+            )
+        else:
+            st.caption("Install 'fpdf' package to enable PDF export.")
+        email_addr = st.text_input("Send conversation to email:")
+        if st.button("Send Email") and email_addr:
+            status = send_conversation_email(email_addr, st.session_state.conversation, pdf_bytes)
+            st.info(status)
+
 if __name__ == "__main__":
     main()
-
 
